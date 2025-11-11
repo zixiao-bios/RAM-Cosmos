@@ -13,6 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
+import math
+from typing import Any, Optional
+
 import math
 import os
 
@@ -211,3 +216,42 @@ def read_and_process_video(
     # Convert to {B, C, T, H, W} format expected by the model
     full_video = full_video.unsqueeze(0).permute(0, 2, 1, 3, 4)  # Add batch dim B=1 and permute
     return full_video
+
+
+def ensure_condition_channels(
+    tensor: torch.Tensor,
+    condition: Any,
+    expected_in_channels: int,
+) -> torch.Tensor:
+    """
+    Ensure `tensor` has the expected number of channels by appending condition masks when necessary.
+
+    Args:
+        tensor: Input tensor of shape (B, C, T, H, W).
+        condition: Conditioning object which might provide `condition_video_input_mask_B_C_T_H_W`.
+        expected_in_channels: Number of channels expected by the downstream network.
+
+    Returns:
+        Tensor with shape (B, expected_in_channels, T, H, W).
+    """
+    current_channels = tensor.shape[1]
+    channel_deficit = expected_in_channels - current_channels
+    if channel_deficit <= 0:
+        return tensor
+
+    condition_mask = getattr(condition, "condition_video_input_mask_B_C_T_H_W", None)
+    if condition_mask is not None:
+        condition_mask = condition_mask.type_as(tensor)
+    else:
+        condition_mask = torch.zeros(
+            (tensor.shape[0], 1, tensor.shape[2], tensor.shape[3], tensor.shape[4]),
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+
+    if condition_mask.shape[1] < channel_deficit:
+        repeat_factor = math.ceil(channel_deficit / condition_mask.shape[1])
+        condition_mask = condition_mask.repeat(1, repeat_factor, 1, 1, 1)
+
+    condition_mask = condition_mask[:, :channel_deficit, :, :, :]
+    return torch.cat([tensor, condition_mask], dim=1)

@@ -51,25 +51,72 @@ input_root/
  └── ...
 """
 
+import argparse
 import math
 import os
-from typing import TYPE_CHECKING
+from typing import List, Optional
 
+from cosmos_predict2._src.imaginaire.flags import INTERNAL
 import torch
 import torchvision
+from loguru import logger
 from megatron.core import parallel_state
 from PIL import Image
 
-from cosmos_predict2._src.imaginaire.flags import INTERNAL
-from cosmos_predict2._src.imaginaire.utils import distributed, log
+from cosmos_predict2._src.imaginaire.utils import distributed
 from cosmos_predict2._src.imaginaire.utils.easy_io import easy_io
+from cosmos_predict2._src.imaginaire.visualize.video import save_img_or_video
 from cosmos_predict2._src.predict2.inference.get_t5_emb import get_text_embedding
 from cosmos_predict2._src.predict2.utils.model_loader import load_model_from_checkpoint
 
 _IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp"]
 _VIDEO_EXTENSIONS = [".mp4"]
-
 _DEFAULT_NEGATIVE_PROMPT = "The video captures a series of frames showing ugly scenes, static with no motion, motion blur, over-saturation, shaky footage, low resolution, grainy texture, pixelated images, poorly lit areas, underexposed and overexposed scenes, poor color balance, washed out colors, choppy sequences, jerky movements, low frame rate, artifacting, color banding, unnatural transitions, outdated special effects, fake elements, unconvincing visuals, poorly edited content, jump cuts, visual noise, and flickering. Overall, the video is of poor quality."
+
+
+def parse_arguments() -> argparse.Namespace:
+    """Parses command-line arguments for the Video2World inference script."""
+    parser = argparse.ArgumentParser(description="Image2World/Video2World inference script")
+    parser.add_argument("--experiment", type=str, required=True, help="Experiment config")
+    parser.add_argument("--num_video_frames", type=int, default=77, help="Number of video frames to generate")
+    parser.add_argument("--guidance", type=int, default=7, help="Guidance value")
+    parser.add_argument("--seed", type=int, default=1, help="Guidance value")
+    parser.add_argument(
+        "--ckpt_path",
+        type=str,
+        default="",
+        help="Path to the checkpoint. If not provided, will use the one specify in the config",
+    )
+    parser.add_argument("--s3_cred", type=str, default="credentials/s3_checkpoint.secret")
+    parser.add_argument(
+        "--resolution",
+        type=str,
+        default="none",
+        help="Resolution of the video (H,W). Be default it will use model trained resolution. 9:16",
+    )
+    parser.add_argument("--input_root", type=str, default="assets/image2world", help="Input root")
+    parser.add_argument("--save_root", type=str, default="results/image2world", help="Save root")
+    parser.add_argument(
+        "--negative_prompt",
+        type=str,
+        default=_DEFAULT_NEGATIVE_PROMPT,
+        help="Custom negative prompt for classifier-free guidance. If not specified, uses default embeddings from S3.",
+    )
+    parser.add_argument(
+        "--num_latent_conditional_frames",
+        type=int,
+        default=1,
+        help="Number of latent conditional frames (0, 1 or 2). For images, both values work by duplicating frames. For videos, uses the first N frames.",
+    )
+    # Context parallel arguments
+    parser.add_argument(
+        "--context_parallel_size",
+        type=int,
+        default=1,
+        help="Context parallel size (number of GPUs to split context over). Set to 8 for 8 GPUs",
+    )
+    parser.add_argument("--prompt_prefix", type=str, default="", help="Prompt prefix")
+    return parser.parse_args()
 
 
 def resize_input(video: torch.Tensor, resolution: list[int]):
@@ -179,7 +226,7 @@ def read_and_process_video(
     # Load video using easy_io
     try:
         video_frames, video_metadata = easy_io.load(video_path)  # Returns (T, H, W, C) numpy array
-        log.info(f"Loaded video with shape {video_frames.shape}, metadata: {video_metadata}")
+        logger.info(f"Loaded video with shape {video_frames.shape}, metadata: {video_metadata}")
     except Exception as e:
         raise ValueError(f"Failed to load video {video_path}: {e}")
 
@@ -191,7 +238,7 @@ def read_and_process_video(
 
     # Calculate how many frames to extract from input video
     frames_to_extract = 4 * (num_latent_conditional_frames - 1) + 1
-    log.info(f"Will extract {frames_to_extract} frames from input video and pad to {num_video_frames}")
+    logger.info(f"Will extract {frames_to_extract} frames from input video and pad to {num_video_frames}")
 
     # Validate num_latent_conditional_frames
     if num_latent_conditional_frames not in [1, 2]:
@@ -210,7 +257,7 @@ def read_and_process_video(
     start_idx = available_frames - frames_to_extract
     extracted_frames = video_tensor[:, start_idx:, :, :]
     full_video[:, :frames_to_extract, :, :] = extracted_frames
-    log.info(f"Extracted last {frames_to_extract} frames from video (frames {start_idx} to {available_frames - 1})")
+    logger.info(f"Extracted last {frames_to_extract} frames from video (frames {start_idx} to {available_frames - 1})")
 
     # Pad remaining frames with the last extracted frame
     if frames_to_extract < num_video_frames:
@@ -218,7 +265,7 @@ def read_and_process_video(
         padding_frames = num_video_frames - frames_to_extract
         last_frame_repeated = last_frame.repeat(1, padding_frames, 1, 1)  # (C, padding_frames, H, W)
         full_video[:, frames_to_extract:, :, :] = last_frame_repeated
-        log.info(f"Padded {padding_frames} frames with last extracted frame")
+        logger.info(f"Padded {padding_frames} frames with last extracted frame")
 
     # Convert to the format expected by the rest of the pipeline
     full_video = full_video.permute(1, 0, 2, 3)  # (C, T, H, W) -> (T, C, H, W)
@@ -245,7 +292,7 @@ class Video2WorldInference:
         ckpt_path: str,
         s3_credential_path: str,
         context_parallel_size: int = 1,
-        config_file: str = "cosmos_predict2/_src/predict2/configs/video2world/config.py",
+        disable_text_encoder: bool = False,
     ):
         """
         Initializes the Video2WorldInference class.
@@ -263,6 +310,7 @@ class Video2WorldInference:
         self.ckpt_path = ckpt_path
         self.s3_credential_path = s3_credential_path
         self.context_parallel_size = context_parallel_size
+        self.disable_text_encoder = disable_text_encoder
         self.process_group = None
 
         # Initialize distributed processing if context parallel size > 1
@@ -273,20 +321,15 @@ class Video2WorldInference:
         experiment_opts = []
         if not INTERNAL:
             experiment_opts.append("~data_train")
-
+        if self.disable_text_encoder:
+            experiment_opts.append("model.config.text_encoder_config.compute_online=false")
         model, config = load_model_from_checkpoint(
             experiment_name=self.experiment_name,
             s3_checkpoint_dir=self.ckpt_path,
-            config_file=config_file,
+            config_file="cosmos_predict2/_src/predict2/configs/video2world/config.py",
             load_ema_to_reg=True,
             experiment_opts=experiment_opts,
         )
-        if TYPE_CHECKING:
-            from cosmos_predict2._src.predict2.models.video2world_model_rectified_flow import (
-                Video2WorldModelRectifiedFlow,
-            )
-
-            model: Video2WorldModelRectifiedFlow = model
 
         # Enable context parallel on the model if using context parallelism
         if self.context_parallel_size > 1:
@@ -311,18 +354,18 @@ class Video2WorldInference:
         # Get the process group for context parallel
         self.process_group = parallel_state.get_context_parallel_group()
 
-        log.info(f"Initialized context parallel with size {self.context_parallel_size}")
-        log.info(f"Current rank: {distributed.get_rank()}, World size: {distributed.get_world_size()}")
+        logger.info(f"Initialized context parallel with size {self.context_parallel_size}")
+        logger.info(f"Current rank: {distributed.get_rank()}, World size: {distributed.get_world_size()}")
 
     def _get_data_batch_input(
         self,
         video: torch.Tensor,
-        prompt: str,
+        prompt: str | List[str],
         num_conditional_frames: int = 1,
         negative_prompt: str = _DEFAULT_NEGATIVE_PROMPT,
         use_neg_prompt: bool = True,
-        camera: torch.Tensor | None = None,
-        action: torch.Tensor | None = None,
+        precomputed_text_embeddings: Optional[torch.Tensor] = None,
+        precomputed_neg_text_embeddings: Optional[torch.Tensor] = None,
     ):
         """
         Prepares the input data batch for the diffusion model.
@@ -337,69 +380,123 @@ class Video2WorldInference:
             num_conditional_frames (int): Number of conditional frames to use.
             negative_prompt (str, optional): Custom negative prompt.
             use_neg_prompt (bool, optional): Whether to include negative prompt embeddings. Defaults to True.
-            camera: (torch.Tensor, optional) Target camera extrinsics and intrinsics for the K output videos, must be provided for camera conditioned model.
-            action: (torch.Tensor, optional) Target robot action for the K output videos, must be provided for action conditioned model.
 
         Returns:
             dict: A dictionary containing the prepared data batch, moved to the correct device and dtype.
         """
         B, C, T, H, W = video.shape
+        device = video.device
+
+        if isinstance(prompt, str):
+            prompts = [prompt] * B
+        else:
+            prompts = list(prompt)
+            if len(prompts) == 1 and B > 1:
+                prompts = prompts * B
+            elif len(prompts) != B:
+                raise ValueError(f"Expected {B} prompts, but got {len(prompts)}.")
+
+        if use_neg_prompt:
+            assert negative_prompt is not None, "Negative prompt is required when use_neg_prompt is True"
+            if isinstance(negative_prompt, str):
+                negative_prompts = [negative_prompt] * B
+            else:
+                negative_prompts = list(negative_prompt)
+                if len(negative_prompts) != B:
+                    raise ValueError(f"Expected {B} negative prompts, but got {len(negative_prompts)}.")
+        else:
+            negative_prompts = []
 
         data_batch = {
             "dataset_name": "video_data",
             "video": video,
-            "camera": camera,
-            "action": action.unsqueeze(0) if action is not None else None,
-            "fps": torch.randint(16, 32, (self.batch_size,)).float(),  # Random FPS (might be used by model)
-            "padding_mask": torch.zeros(self.batch_size, 1, H, W),  # Padding mask (assumed no padding here)
-            "num_conditional_frames": num_conditional_frames,  # Specify number of conditional frames
+            "fps": torch.randint(16, 32, (B,), device=device).float(),
+            "padding_mask": torch.zeros(B, 1, H, W, device=device, dtype=video.dtype),
+            "num_conditional_frames": num_conditional_frames,
         }
 
-        if use_neg_prompt:
-            assert negative_prompt is not None, "Negative prompt is required when use_neg_prompt is True"
-
-        # Compute text embeddings
         if self.model.text_encoder is not None:
-            data_batch["ai_caption"] = [prompt]
-            data_batch["t5_text_embeddings"] = self.model.text_encoder.compute_text_embeddings_online(
-                data_batch={"ai_caption": [prompt], "images": None},
-                input_caption_key="ai_caption",
-            )
-            if use_neg_prompt:
-                data_batch["neg_t5_text_embeddings"] = self.model.text_encoder.compute_text_embeddings_online(
-                    data_batch={"ai_caption": [negative_prompt], "images": None},
+            data_batch["ai_caption"] = prompts
+            if precomputed_text_embeddings is not None:
+                emb = torch.as_tensor(precomputed_text_embeddings, device=video.device)
+                if emb.ndim == 2:
+                    emb = emb.unsqueeze(0)
+                if emb.shape[0] != B:
+                    raise ValueError(
+                        f"Precomputed text embeddings batch dimension {emb.shape[0]} "
+                        f"does not match video batch size {B}."
+                    )
+                data_batch["t5_text_embeddings"] = emb
+                if use_neg_prompt:
+                    if precomputed_neg_text_embeddings is None:
+                        raise ValueError(
+                            "Negative prompt embeddings are required when use_neg_prompt=True."
+                        )
+                    neg_emb = torch.as_tensor(precomputed_neg_text_embeddings, device=video.device)
+                    if neg_emb.ndim == 2:
+                        neg_emb = neg_emb.unsqueeze(0)
+                    if neg_emb.shape[0] != B:
+                        raise ValueError(
+                            f"Precomputed negative embeddings batch dimension {neg_emb.shape[0]} "
+                            f"does not match video batch size {B}."
+                        )
+                    data_batch["neg_t5_text_embeddings"] = neg_emb
+            else:
+                data_batch["t5_text_embeddings"] = self.model.text_encoder.compute_text_embeddings_online(
+                    data_batch={"ai_caption": prompts, "images": None},
                     input_caption_key="ai_caption",
                 )
+                if use_neg_prompt:
+                    data_batch["neg_t5_text_embeddings"] = self.model.text_encoder.compute_text_embeddings_online(
+                        data_batch={"ai_caption": negative_prompts, "images": None},
+                        input_caption_key="ai_caption",
+                    )
         else:
-            data_batch["t5_text_embeddings"] = get_text_embedding(prompt)
+            if precomputed_text_embeddings is None:
+                raise RuntimeError(
+                    "Text encoder is disabled, but precomputed text embeddings were not provided."
+                )
+            emb = torch.as_tensor(precomputed_text_embeddings, device=video.device)
+            if emb.ndim == 2:
+                emb = emb.unsqueeze(0)
+            if emb.shape[0] != B:
+                raise ValueError(
+                    f"Precomputed text embeddings batch dimension {emb.shape[0]} "
+                    f"does not match video batch size {B}."
+                )
+            data_batch["t5_text_embeddings"] = emb
             if use_neg_prompt:
-                data_batch["neg_t5_text_embeddings"] = get_text_embedding(negative_prompt)
+                if precomputed_neg_text_embeddings is None:
+                    raise RuntimeError(
+                        "Negative prompt embeddings are required when text encoder is disabled "
+                        "and use_neg_prompt=True."
+                    )
+                neg_emb = torch.as_tensor(precomputed_neg_text_embeddings, device=video.device)
+                if neg_emb.ndim == 2:
+                    neg_emb = neg_emb.unsqueeze(0)
+                if neg_emb.shape[0] != B:
+                    raise ValueError(
+                        f"Precomputed negative embeddings batch dimension {neg_emb.shape[0]} "
+                        f"does not match video batch size {B}."
+                    )
+                data_batch["neg_t5_text_embeddings"] = neg_emb
 
-        # Move tensors to GPU and convert to bfloat16 if they are floating point
         for k, v in data_batch.items():
-            if isinstance(v, torch.Tensor) and torch.is_floating_point(data_batch[k]):
-                data_batch[k] = v.cuda().to(dtype=torch.bfloat16)
+            if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
+                data_batch[k] = v.to(device="cuda").to(dtype=torch.bfloat16)
 
         return data_batch
 
     def generate_vid2world(
         self,
         prompt: str,
-        input_path: str | torch.Tensor | None,
+        input_path: str,
         guidance: int = 7,
         num_video_frames: int = 77,
         num_latent_conditional_frames: int = 1,
-        num_input_video: int = 1,
-        num_output_video: int = 1,
         resolution: str = "192,320",
         seed: int = 1,
         negative_prompt: str = _DEFAULT_NEGATIVE_PROMPT,
-        camera: torch.Tensor | None = None,
-        action: torch.Tensor | None = None,
-        num_steps: int = 35,
-        offload_diffusion_model: bool = False,
-        offload_text_encoder: bool = False,
-        offload_tokenizer: bool = False,
     ):
         """
         Generates a video based on an input image or video and text prompt.
@@ -408,28 +505,18 @@ class Video2WorldInference:
         model sampling, and decodes the result into a video tensor.
 
         Args:
-            prompt: The text prompt describing the desired video content/style.
-            input_path: Path to the input image or video file or a torch.Tensor.
-            guidance: Classifier-free guidance scale. Defaults to 7.
-            num_video_frames: Number of video frames to generate. Defaults to 77.
-            num_latent_conditional_frames : Number of latent conditional frames. Defaults to 1.
-            resolution: Target video resolution in "H,W" format. Defaults to "192,320".
-            seed: Random seed for reproducibility. Defaults to 1.
-            negative_prompt: Custom negative prompt. Defaults to the predefined default negative prompt.
-            camera: Target camera extrinsics and intrinsics for the K output videos. Must be provided if model is camera conditioned.
-            action: Target robot action for the K output videos. Must be provided if model is action conditioned.
-            num_steps: Number of generation steps. Defaults to 35.
-            offload_diffusion_model: If True, offload diffusion model to CPU to save GPU memory. Defaults to False.
-            offload_text_encoder: If True, offload text encoder to CPU to save GPU memory. Defaults to False.
-            offload_tokenizer: If True, offload tokenizer to CPU to save GPU memory. Defaults to False.
+            prompt (str): The text prompt describing the desired video content/style.
+            input_path (str): Path to the input image or video file.
+            guidance (int, optional): Classifier-free guidance scale. Defaults to 7.
+            num_video_frames (int, optional): Number of video frames to generate. Defaults to 77.
+            num_latent_conditional_frames (int, optional): Number of latent conditional frames. Defaults to 1.
+            resolution (str, optional): Target video resolution in "H,W" format. Defaults to "192,320".
+            seed (int, optional): Random seed for reproducibility. Defaults to 1.
+            negative_prompt (str, optional): Custom negative prompt. Defaults to the predefined default negative prompt.
 
         Returns:
             torch.Tensor: The generated video tensor (B, C, T, H, W) in the range [-1, 1].
         """
-        assert camera is not None or action is not None or num_input_video == 1 and num_output_video == 1, (
-            "expected num_output_video==1 and num_output_video==1 for no camera conditioning or action conditioning"
-        )
-
         # Parse resolution string into tuple of integers
         if resolution == "none":
             h, w = self.model.get_video_height_width()
@@ -443,14 +530,10 @@ class Video2WorldInference:
         model_required_frames = self.model.tokenizer.get_pixel_num_frames(self.model.config.state_t)
 
         # Determine if input is image or video and process accordingly
-        if input_path is None or num_latent_conditional_frames == 0:
-            vid_input = torch.zeros(1, 3, model_required_frames, video_resolution[0], video_resolution[1]).to(
-                torch.uint8
-            )
-        elif isinstance(input_path, str):
+        if num_latent_conditional_frames > 0:
             ext = os.path.splitext(input_path)[1].lower()
             if ext in _IMAGE_EXTENSIONS:
-                log.info(f"Processing image input: {input_path}")
+                logger.info(f"Processing image input: {input_path}")
                 vid_input = read_and_process_image(
                     img_path=input_path,
                     resolution=video_resolution,
@@ -458,7 +541,7 @@ class Video2WorldInference:
                     resize=True,
                 )
             elif ext in _VIDEO_EXTENSIONS:
-                log.info(f"Processing video input: {input_path}")
+                logger.info(f"Processing video input: {input_path}")
                 vid_input = read_and_process_video(
                     video_path=input_path,
                     resolution=video_resolution,
@@ -470,112 +553,37 @@ class Video2WorldInference:
                 raise ValueError(
                     f"Unsupported file extension: {ext}. Supported extensions: {_IMAGE_EXTENSIONS + _VIDEO_EXTENSIONS}"
                 )
-        elif isinstance(input_path, torch.Tensor):
-            vid_input = input_path
         else:
-            raise ValueError(f"Unsupported input_path type: {type(input_path)}")
+            vid_input = torch.zeros(1, 3, model_required_frames, video_resolution[0], video_resolution[1]).to(
+                torch.uint8
+            )
+
+        vid_input = vid_input[:, :3, :, :, :]
 
         # Prepare the data batch with text embeddings
-        # Note: TextEncoder.compute_text_embeddings_online() will automatically move its model to GPU
         data_batch = self._get_data_batch_input(
-            video=vid_input,
-            prompt=prompt,
-            camera=camera,
-            action=action,
+            vid_input,
+            prompt,
             num_conditional_frames=num_latent_conditional_frames,
             negative_prompt=negative_prompt,
             use_neg_prompt=True,
         )
 
         mem_bytes = torch.cuda.memory_allocated(device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-        log.info(f"GPU memory usage after getting data_batch: {mem_bytes / (1024**3):.2f} GB")
-
-        # Memory Optimization Step 1: Offload Text Encoder
-        # Offload text encoder after computing embeddings to free memory
-        if offload_text_encoder and self.model.text_encoder is not None:
-            log.info("[Memory Optimization] Offloading text encoder to CPU")
-            # TextEncoder is a wrapper class with self.model (the actual neural network)
-            if hasattr(self.model.text_encoder, "model") and self.model.text_encoder.model is not None:
-                self.model.text_encoder.model = self.model.text_encoder.model.to("cpu")
-            torch.cuda.empty_cache()
-
-        # Memory Optimization Step 2: Tokenizer Encoder
-        # Load tokenizer encoder to GPU for encoding input video
-        if offload_tokenizer:
-            log.info("[Memory Optimization] Loading tokenizer encoder to GPU")
-            if hasattr(self.model.tokenizer, "encoder") and self.model.tokenizer.encoder is not None:
-                self.model.tokenizer.encoder = self.model.tokenizer.encoder.to("cuda")
-            torch.cuda.empty_cache()
-
-        # Memory Optimization Step 3: Diffusion Network
-        # Load the main diffusion network to GPU for sampling
-        if offload_diffusion_model:
-            log.info("[Memory Optimization] Loading diffusion network to GPU")
-            self.model.net = self.model.net.to("cuda")
-            # Also load conditioner if it exists
-            if hasattr(self.model, "conditioner") and self.model.conditioner is not None:
-                self.model.conditioner = self.model.conditioner.to("cuda")
-            torch.cuda.empty_cache()
-
-        extra_kwargs = {}
-        if camera is not None:
-            extra_kwargs = {
-                "num_input_video": num_input_video,
-                "num_output_video": num_output_video,
-            }
+        logger.info(f"GPU memory usage after getting data_batch: {mem_bytes / (1024**3):.2f} GB")
 
         # Generate latent samples using the diffusion model
         # Video should be of shape torch.Size([1, 3, 93, 192, 320]) # Note: Shape check comment
-        log.info("[Memory Optimization] Starting latent sample generation")
         sample = self.model.generate_samples_from_batch(
             data_batch,
             n_sample=1,  # Generate one sample
             guidance=guidance,
             seed=seed,  # Fixed seed for reproducibility
             is_negative_prompt=True,  # Use classifier-free guidance
-            num_steps=num_steps,
-            **extra_kwargs,
         )
 
-        # Memory Optimization Step 4: Offload Diffusion Network
-        # Offload diffusion network after sampling to make room for decoder
-        if offload_diffusion_model:
-            log.info("[Memory Optimization] Offloading diffusion network to CPU")
-            self.model.net = self.model.net.to("cpu")
-            if hasattr(self.model, "conditioner") and self.model.conditioner is not None:
-                self.model.conditioner = self.model.conditioner.to("cpu")
-            # Also offload encoder since we only need decoder now
-            if hasattr(self.model.tokenizer, "encoder") and self.model.tokenizer.encoder is not None:
-                self.model.tokenizer.encoder = self.model.tokenizer.encoder.to("cpu")
-            torch.cuda.empty_cache()
-
-        # Memory Optimization Step 5: Load Decoder
-        # Load tokenizer decoder to GPU for decoding latents
-        if offload_tokenizer:
-            log.info("[Memory Optimization] Loading tokenizer decoder to GPU")
-            if hasattr(self.model.tokenizer, "decoder") and self.model.tokenizer.decoder is not None:
-                self.model.tokenizer.decoder = self.model.tokenizer.decoder.to("cuda")
-            torch.cuda.empty_cache()
-
-        # Decode the latent samples
-        if isinstance(sample, list):
-            # Decode the latent sample into a video tensor
-            video_list = []
-            for sample_chunk in sample:
-                video_chunk = self.model.decode(sample_chunk)
-                video_list.append(video_chunk)
-            video = torch.cat(video_list, dim=3)
-        else:
-            # Decode the latent sample into a video tensor
-            video = self.model.decode(sample)
-
-        # Memory Optimization Step 6: Final Cleanup
-        # Offload decoder after decoding
-        if offload_tokenizer:
-            log.info("[Memory Optimization] Offloading tokenizer decoder to CPU")
-            if hasattr(self.model.tokenizer, "decoder") and self.model.tokenizer.decoder is not None:
-                self.model.tokenizer.decoder = self.model.tokenizer.decoder.to("cpu")
-            torch.cuda.empty_cache()
+        # Decode the latent sample into a video tensor
+        video = self.model.decode(sample)
 
         return video
 
@@ -588,3 +596,107 @@ class Video2WorldInference:
             if parallel_state.is_initialized():
                 parallel_state.destroy_model_parallel()
             dist.destroy_process_group()
+
+
+def main():
+    torch.enable_grad(False)  # Disable gradient calculations for inference
+    args = parse_arguments()
+
+    # Validate num_latent_conditional_frames at the very beginning
+    if args.num_latent_conditional_frames not in [0, 1, 2]:
+        raise ValueError(
+            f"num_latent_conditional_frames must be 0, 1 or 2, but got {args.num_latent_conditional_frames}"
+        )
+
+    # Determine supported extensions based on num_latent_conditional_frames
+    if args.num_latent_conditional_frames > 1:
+        supported_extensions = _VIDEO_EXTENSIONS
+        # Check if input folder contains any videos
+        has_videos = False
+        for file_name in os.listdir(args.input_root):
+            file_ext = os.path.splitext(file_name)[1].lower()
+            if file_ext in _VIDEO_EXTENSIONS:
+                has_videos = True
+                break
+
+        if not has_videos:
+            raise ValueError(
+                f"num_latent_conditional_frames={args.num_latent_conditional_frames} > 1 requires video inputs, "
+                f"but no videos found in {args.input_root}. Found extensions: "
+                f"{set(os.path.splitext(f)[1].lower() for f in os.listdir(args.input_root) if os.path.splitext(f)[1])}"
+            )
+
+        logger.info(f"Using video-only mode with {args.num_latent_conditional_frames} conditional frames")
+    elif args.num_latent_conditional_frames == 1:
+        supported_extensions = _IMAGE_EXTENSIONS + _VIDEO_EXTENSIONS
+        logger.info(f"Using image+video mode with {args.num_latent_conditional_frames} conditional frame")
+    else:  # args.num_latent_conditional_frames == 0
+        supported_extensions = _IMAGE_EXTENSIONS + _VIDEO_EXTENSIONS
+        logger.info(f"Using text-to-world mode with {args.num_latent_conditional_frames} conditional frames")
+
+    # Initialize the inference handler with context parallel support
+    s3_cred = ""
+
+    video2world_cli = Video2WorldInference(
+        args.experiment, args.ckpt_path, s3_cred, context_parallel_size=args.context_parallel_size
+    )
+
+    mem_bytes = torch.cuda.memory_allocated(device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    logger.info(f"GPU memory usage after model dcp.load: {mem_bytes / (1024**3):.2f} GB")
+
+    # Only process files on rank 0 if using distributed processing
+    rank0 = True
+    if args.context_parallel_size > 1:
+        rank0 = distributed.get_rank() == 0
+
+    # Ensure save directory exists
+    os.makedirs(args.save_root, exist_ok=True)
+
+    # Process each file in the input directory
+    for file_name in os.listdir(args.input_root):
+        # Look for supported files
+        file_ext = os.path.splitext(file_name)[1].lower()
+        if file_ext in supported_extensions:
+            input_path = os.path.join(args.input_root, file_name)
+
+            # Look for corresponding prompt file
+            base_name = os.path.splitext(file_name)[0]
+            prompt_path = os.path.join(args.input_root, base_name + ".txt")
+
+            if not os.path.exists(prompt_path):
+                logger.warning(f"No prompt file found for {file_name}, skipping...")
+                continue
+
+            with open(prompt_path, "r") as f:
+                prompt = f.read().strip()
+
+            if rank0:
+                logger.info(f"Processing {file_name} with prompt: {prompt}")
+                logger.info(f"Using {args.num_latent_conditional_frames} latent conditional frames")
+
+            full_prompt = args.prompt_prefix + prompt
+            video = video2world_cli.generate_vid2world(
+                prompt=full_prompt,
+                input_path=input_path,
+                guidance=args.guidance,
+                num_video_frames=args.num_video_frames,
+                num_latent_conditional_frames=args.num_latent_conditional_frames,
+                resolution=args.resolution,
+                seed=args.seed,
+                negative_prompt=args.negative_prompt,
+            )
+
+            if rank0:
+                output_name = os.path.splitext(file_name)[0]
+                save_img_or_video((1.0 + video[0]) / 2, f"{args.save_root}/{output_name}", fps=16)
+                logger.info(f"Saved video for {file_name} to {args.save_root}/{output_name}")
+    # Synchronize all processes before cleanup
+    if args.context_parallel_size > 1:
+        torch.distributed.barrier()
+
+    # Clean up distributed resources
+    video2world_cli.cleanup()
+
+
+if __name__ == "__main__":
+    main()
